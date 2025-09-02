@@ -3,33 +3,60 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>불법주정차 민원 히트맵 + 실시간 위치</title>
+  <title>불법주정차 민원 히트맵 · 요일·시간 필터 + 실시간 위치</title>
 
   <!-- Leaflet -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <style>
     html, body { height:100%; margin:0; }
     #map { height:100vh; }
+
+    /* 상단 컨트롤 바 */
+    .controls {
+      position: absolute; z-index: 1000; left: 8px; top: 8px;
+      background: rgba(255,255,255,.95); padding: 8px 10px; border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,.15); font-size: 13px; line-height: 1.4;
+    }
+    .controls label { margin-right: 6px; }
+    .controls select, .controls input[type="range"] {
+      vertical-align: middle;
+    }
     .hud {
       position: absolute; z-index: 1000; left: 8px; bottom: 8px;
       background: rgba(0,0,0,.6); color: #fff; padding: 6px 8px; border-radius: 6px;
-      font-size: 12px; line-height: 1.4; max-width: 60vw;
-    }
-    .legend {
-      position:absolute; z-index:1000; right:8px; bottom:8px;
-      background: rgba(255,255,255,.9); padding:6px 8px; border-radius:6px;
-      font-size:12px; line-height:1.4; color:#333;
+      font-size: 12px; line-height: 1.4; max-width: 70vw;
     }
   </style>
 </head>
 <body>
   <div id="map"></div>
-  <div class="hud" id="hud">GPS 대기중…</div>
-  <div class="legend">
-    <b>히트맵 표시</b><br/>
-    점수(밀도)가 높을수록 더 진하게 표시됩니다.<br/>
-    데이터: 지오코딩된 민원 CSV
+
+  <!-- 상단: 요일·시간 필터 UI -->
+  <div class="controls">
+    <label>요일
+      <select id="dowSel">
+        <option value="all">전체</option>
+        <option value="0">월</option>
+        <option value="1">화</option>
+        <option value="2">수</option>
+        <option value="3">목</option>
+        <option value="4">금</option>
+        <option value="5">토</option>
+        <option value="6">일</option>
+      </select>
+    </label>
+    <label style="margin-left:8px;">시간
+      <input id="hourRange" type="range" min="0" max="23" step="1" value="9" />
+      <span id="hourLabel">09시</span>
+      <label style="margin-left:6px;">
+        <input id="allHours" type="checkbox" />
+        전체시간
+      </label>
+    </label>
   </div>
+
+  <!-- 좌하단: 위치/HUD -->
+  <div class="hud" id="hud">GPS 대기중…</div>
 
   <!-- Scripts -->
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -47,8 +74,14 @@
     }).addTo(map);
     map.setView([36.64, 127.49], 12); // 임시 중심(청주 근처)
 
+    // UI 요소
+    const dowSel = document.getElementById('dowSel');
+    const hourRange = document.getElementById('hourRange');
+    const hourLabel = document.getElementById('hourLabel');
+    const allHoursChk = document.getElementById('allHours');
+
     // ─────────────────────────────
-    // 1) CSV 경로 자동 탐지
+    // 1) CSV 경로 자동 탐지 (한글/공백/괄호 파일명 포함)
     // ─────────────────────────────
     const rawCandidates = [
       '지오코딩결과_전체 (1).csv',
@@ -62,11 +95,11 @@
         if (!pth.endsWith('/')) pth = pth.replace(/\/[^/]*$/, '/');
         return location.origin + pth;
       })();
-      return base + encodeURI(p) + '?v=' + Date.now(); // 캐시 방지 + 한글 파일명 안전
+      return base + encodeURI(p) + '?v=' + Date.now(); // 캐시 방지 + 안전 인코딩
     });
 
     // ─────────────────────────────
-    // 2) CSV 파싱 헬퍼
+    // 2) CSV 파싱/칼럼 인식
     // ─────────────────────────────
     const LAT_KEYS = ['위도','lat','latitude','Lat','Latitude','Y','y'];
     const LON_KEYS = ['경도','lon','longitude','Lon','Longitude','X','x'];
@@ -86,16 +119,37 @@
       const s = v.toString().trim().replace(/[, ]/g,'');
       return s ? Number(s) : NaN;
     }
+    // 한국식/여러 포맷 날짜 파서 → Date(로컬, KST)
+    function parseDateLoose(val) {
+      if (!val) return null;
+      let s = String(val).trim();
+      // 2020.07.17 09:05 → 2020-07-17 09:05
+      s = s.replace(/[./]/g, '-');
+      const nums = s.match(/\d+/g);
+      if (!nums || nums.length < 3) {
+        const d = new Date(s);
+        return isNaN(d) ? null : d;
+      }
+      const [Y,M,D,h=0,m=0,s2=0] = nums.map(n => parseInt(n, 10));
+      const d = new Date(Y, (M||1)-1, D||1, h, m, s2);
+      return isNaN(d) ? null : d;
+    }
+    // 월(0)~일(6)로 맞추기
+    function getMon0Dow(d) { return (d.getDay()+6)%7; } // Mon=0 ... Sun=6
+    function pad2(n){ return (n<10?'0':'')+n; }
 
     // ─────────────────────────────
-    // 3) CSV 로드 → 히트맵 생성
+    // 3) 데이터 적재 및 버킷 구성
+    //    pointsByHOW[0..167] = [[lat,lon,1], ...]
     // ─────────────────────────────
     let heatLayer = null;
+    const pointsByHOW = Array.from({length: 168}, () => []);
+    let allPoints = []; // 전체시간
 
     async function loadCSV() {
       for (const url of candidates) {
         try {
-          const data = await new Promise((resolve, reject) => {
+          const res = await new Promise((resolve, reject) => {
             Papa.parse(url, {
               header: true,
               download: true,
@@ -104,35 +158,51 @@
               error: err => reject(err)
             });
           });
+          if (!res || !res.data || res.data.length === 0) continue;
 
-          if (!data || !data.data || data.data.length === 0) continue;
-
-          const header = data.meta && data.meta.fields ? data.meta.fields : Object.keys(data.data[0] || {});
+          const header = res.meta && res.meta.fields ? res.meta.fields : Object.keys(res.data[0] || {});
           const latKey = findKey(LAT_KEYS, header);
           const lonKey = findKey(LON_KEYS, header);
-          const dateKey = findKey(DATE_KEYS, header); // 있을 수도, 없을 수도
+          const dateKey = findKey(DATE_KEYS, header); // 없을 수도 있음
+          if (!latKey || !lonKey) { console.warn('위도/경도 컬럼을 찾지 못함:', header); continue; }
 
-          if (!latKey || !lonKey) { console.warn('위도/경도 컬럼을 찾지 못했습니다:', header); continue; }
+          // 초기화
+          for (let i=0;i<168;i++) pointsByHOW[i] = [];
+          allPoints = [];
 
-          const points = [];
-          for (const row of data.data) {
+          let valid = 0, dated = 0;
+          for (const row of res.data) {
             const lat = toNum(row[latKey]);
             const lon = toNum(row[lonKey]);
-            if (Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180) {
-              points.push([lat, lon, 1]); // intensity=1
+            if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat)>90 || Math.abs(lon)>180) continue;
+
+            allPoints.push([lat, lon, 1]);
+            valid++;
+
+            if (dateKey && row[dateKey]) {
+              const d = parseDateLoose(row[dateKey]);
+              if (d) {
+                const dow = getMon0Dow(d);      // 0~6
+                const hour = d.getHours();      // 0~23
+                const how = dow*24 + hour;      // 0~167
+                pointsByHOW[how].push([lat, lon, 1]);
+                dated++;
+              }
             }
           }
-          if (points.length === 0) { console.warn('유효 좌표 없음:', url); continue; }
 
-          if (heatLayer) map.removeLayer(heatLayer);
-          heatLayer = L.heatLayer(points, { radius: 18, blur: 15, maxZoom: 18 }).addTo(map);
+          // 기본 렌더(전체시간)
+          renderHeat('all', 9);
 
-          const latLngs = points.map(p => L.latLng(p[0], p[1]));
-          const bounds = L.latLngBounds(latLngs);
-          map.fitBounds(bounds, { padding: [20, 20] });
+          // UI 활성/라벨
+          const hasDate = dated > 0;
+          dowSel.disabled = !hasDate;
+          hourRange.disabled = !hasDate;
+          allHoursChk.checked = !hasDate; // 날짜 없으면 강제 전체시간
+          hourLabel.textContent = pad2(parseInt(hourRange.value,10)) + '시';
 
-          console.log('CSV 로드 성공:', url, '레코드 수:', points.length, '사용 컬럼:', {latKey, lonKey, dateKey});
-          return; // 첫 성공에서 종료
+          console.log('CSV 로드 성공:', url, { validRecords: valid, withDatetime: dated, latKey, lonKey, dateKey });
+          return;
         } catch (e) {
           console.warn('CSV 로드 실패:', url, e);
         }
@@ -142,7 +212,49 @@
     }
 
     // ─────────────────────────────
-    // 4) 현재 위치 "지속" 추적 (watchPosition)
+    // 4) 히트맵 렌더러 (필터 반영)
+    // ─────────────────────────────
+    function renderHeat(dowValue, hourValue) {
+      let pts = [];
+      if (allHoursChk.checked || dowValue === 'all') {
+        // 전체시간(또는 전체 요일) → 전체 포인트
+        pts = allPoints;
+      } else {
+        const dow = parseInt(dowValue, 10);    // 0~6
+        const hour = parseInt(hourValue, 10);  // 0~23
+        const how = dow*24 + hour;
+        pts = pointsByHOW[how] || [];
+      }
+
+      if (heatLayer) map.removeLayer(heatLayer);
+      if (pts.length > 0) {
+        heatLayer = L.heatLayer(pts, { radius: 18, blur: 15, maxZoom: 18 }).addTo(map);
+
+        // 범위 맞추기(줌이 너무 튀지 않게 최소 패딩)
+        const latLngs = pts.map(p => L.latLng(p[0], p[1]));
+        const bounds = L.latLngBounds(latLngs);
+        // 현재 화면과 너무 다르면만 이동
+        map.fitBounds(bounds, { padding: [20, 20] });
+      } else {
+        heatLayer = null;
+        console.warn('선택 조건에 해당하는 포인트가 없습니다.');
+      }
+    }
+
+    // UI 이벤트
+    dowSel.addEventListener('change', () => {
+      renderHeat(dowSel.value, hourRange.value);
+    });
+    hourRange.addEventListener('input', () => {
+      hourLabel.textContent = pad2(parseInt(hourRange.value,10)) + '시';
+      renderHeat(dowSel.value, hourRange.value);
+    });
+    allHoursChk.addEventListener('change', () => {
+      renderHeat(dowSel.value, hourRange.value);
+    });
+
+    // ─────────────────────────────
+    // 5) 현재 위치 "지속" 추적 (watchPosition)
     // ─────────────────────────────
     const hud = document.getElementById('hud');
     let myMarker = null;
@@ -160,7 +272,8 @@
         accCircle.setLatLng(latlng); accCircle.setRadius(acc || 10);
       }
 
-      map.setView(latlng, Math.max(map.getZoom(), 15)); // 따라가기
+      // 위치 이동 시 화면 따라가기
+      map.setView(latlng, Math.max(map.getZoom(), 15));
 
       const accStr = (acc != null) ? `${Math.round(acc)} m` : '-';
       const spd = (speed != null && !Number.isNaN(speed)) ? (speed * 3.6) : null; // m/s -> km/h
@@ -182,10 +295,13 @@
     }
 
     // ─────────────────────────────
-    // 5) 시작
+    // 6) 시작
     // ─────────────────────────────
     loadCSV();
     startWatch();
+
+    // 초기 시간 라벨 표시
+    hourLabel.textContent = (hourRange.value.padStart ? hourRange.value.padStart(2,'0') : ('0'+hourRange.value).slice(-2)) + '시';
   </script>
 </body>
 </html>
