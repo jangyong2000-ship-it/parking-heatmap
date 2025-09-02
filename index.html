@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>불법주정차 민원 히트맵 + 실시간 위치</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    html, body { height:100%; margin:0; }
+    #map { height:100vh; }
+    .hud {
+      position: absolute; z-index: 1000; left: 8px; bottom: 8px;
+      background: rgba(0,0,0,.6); color: #fff; padding: 6px 8px; border-radius: 6px;
+      font-size: 12px; line-height: 1.4; max-width: 60vw;
+    }
+    .legend {
+      position:absolute; z-index:1000; right:8px; bottom:8px;
+      background: rgba(255,255,255,.9); padding:6px 8px; border-radius:6px;
+      font-size:12px; line-height:1.4; color:#333;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="hud" id="hud">GPS 대기중…</div>
+  <div class="legend">
+    <b>히트맵 표시</b><br/>
+    점수(밀도)가 높을수록 더 진하게 표시됩니다.<br/>
+    데이터: 지오코딩된 민원 CSV
+  </div>
+
+  <!-- Scripts -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
+  <script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+
+  <script>
+    // ─────────────────────────────
+    // 0) 지도 생성 + 베이스맵
+    // ─────────────────────────────
+    const map = L.map('map');
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 20,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+    map.setView([36.64, 127.49], 12); // 임시 중심(청주 근처)
+
+    // ─────────────────────────────
+    // 1) CSV 경로 자동 탐지
+    // ─────────────────────────────
+    const rawCandidates = [
+      '지오코딩결과_전체 (1).csv',
+      '지오코딩결과_전체.csv',
+      'geocoded.csv',
+      'data/geocoded.csv'
+    ];
+    const candidates = rawCandidates.map(p => {
+      const base = (function () {
+        let pth = location.pathname;
+        if (!pth.endsWith('/')) pth = pth.replace(/\/[^/]*$/, '/');
+        return location.origin + pth;
+      })();
+      return base + encodeURI(p) + '?v=' + Date.now(); // 캐시 방지 + 한글 파일명 안전
+    });
+
+    // ─────────────────────────────
+    // 2) CSV 파싱 헬퍼
+    // ─────────────────────────────
+    const LAT_KEYS = ['위도','lat','latitude','Lat','Latitude','Y','y'];
+    const LON_KEYS = ['경도','lon','longitude','Lon','Longitude','X','x'];
+    const DATE_KEYS = ['단속일시','발생일시','신고일시','일시','date','Date','datetime','Datetime'];
+
+    function findKey(keys, header) {
+      const lower = header.map(h => (h||'').toString().toLowerCase());
+      for (const k of keys) {
+        const idx = lower.indexOf(k.toLowerCase());
+        if (idx !== -1) return header[idx];
+      }
+      return null;
+    }
+    function toNum(v) {
+      if (typeof v === 'number') return v;
+      if (v == null) return NaN;
+      const s = v.toString().trim().replace(/[, ]/g,'');
+      return s ? Number(s) : NaN;
+    }
+
+    // ─────────────────────────────
+    // 3) CSV 로드 → 히트맵 생성
+    // ─────────────────────────────
+    let heatLayer = null;
+
+    async function loadCSV() {
+      for (const url of candidates) {
+        try {
+          const data = await new Promise((resolve, reject) => {
+            Papa.parse(url, {
+              header: true,
+              download: true,
+              skipEmptyLines: true,
+              complete: results => resolve(results),
+              error: err => reject(err)
+            });
+          });
+
+          if (!data || !data.data || data.data.length === 0) continue;
+
+          const header = data.meta && data.meta.fields ? data.meta.fields : Object.keys(data.data[0] || {});
+          const latKey = findKey(LAT_KEYS, header);
+          const lonKey = findKey(LON_KEYS, header);
+          const dateKey = findKey(DATE_KEYS, header); // 있을 수도, 없을 수도
+
+          if (!latKey || !lonKey) { console.warn('위도/경도 컬럼을 찾지 못했습니다:', header); continue; }
+
+          const points = [];
+          for (const row of data.data) {
+            const lat = toNum(row[latKey]);
+            const lon = toNum(row[lonKey]);
+            if (Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180) {
+              points.push([lat, lon, 1]); // intensity=1
+            }
+          }
+          if (points.length === 0) { console.warn('유효 좌표 없음:', url); continue; }
+
+          if (heatLayer) map.removeLayer(heatLayer);
+          heatLayer = L.heatLayer(points, { radius: 18, blur: 15, maxZoom: 18 }).addTo(map);
+
+          const latLngs = points.map(p => L.latLng(p[0], p[1]));
+          const bounds = L.latLngBounds(latLngs);
+          map.fitBounds(bounds, { padding: [20, 20] });
+
+          console.log('CSV 로드 성공:', url, '레코드 수:', points.length, '사용 컬럼:', {latKey, lonKey, dateKey});
+          return; // 첫 성공에서 종료
+        } catch (e) {
+          console.warn('CSV 로드 실패:', url, e);
+        }
+      }
+      alert('CSV를 찾지 못했거나, 위도/경도 컬럼을 인식하지 못했습니다.\n' +
+            '파일명을 지오코딩결과_전체 (1).csv 또는 geocoded.csv 로 업로드했는지 확인하세요.');
+    }
+
+    // ─────────────────────────────
+    // 4) 현재 위치 "지속" 추적 (watchPosition)
+    // ─────────────────────────────
+    const hud = document.getElementById('hud');
+    let myMarker = null;
+    let accCircle = null;
+
+    function updateMyLocation(lat, lon, acc, speed) {
+      const latlng = [lat, lon];
+
+      if (!myMarker) myMarker = L.marker(latlng).addTo(map).bindPopup('내 위치');
+      else myMarker.setLatLng(latlng);
+
+      if (!accCircle) {
+        accCircle = L.circle(latlng, { radius: acc || 10, weight: 1, fillOpacity: 0.15 }).addTo(map);
+      } else {
+        accCircle.setLatLng(latlng); accCircle.setRadius(acc || 10);
+      }
+
+      map.setView(latlng, Math.max(map.getZoom(), 15)); // 따라가기
+
+      const accStr = (acc != null) ? `${Math.round(acc)} m` : '-';
+      const spd = (speed != null && !Number.isNaN(speed)) ? (speed * 3.6) : null; // m/s -> km/h
+      hud.textContent = `내 위치: ${lat.toFixed(6)}, ${lon.toFixed(6)}  |  정확도: ${accStr}` +
+                        (spd != null ? `  |  속도: ${spd.toFixed(1)} km/h` : '');
+    }
+    function handleGeoError(err) { console.warn('Geolocation error:', err); hud.textContent = `GPS 오류: ${err.message}`; }
+
+    function startWatch() {
+      if (!('geolocation' in navigator)) { hud.textContent = '이 브라우저는 위치 서비스를 지원하지 않습니다.'; return; }
+      navigator.geolocation.watchPosition(
+        pos => {
+          const { latitude, longitude, accuracy, speed } = pos.coords;
+          updateMyLocation(latitude, longitude, accuracy, speed);
+        },
+        handleGeoError,
+        { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
+      );
+    }
+
+    // ─────────────────────────────
+    // 5) 시작
+    // ─────────────────────────────
+    loadCSV();
+    startWatch();
+  </script>
+</body>
+</html>
